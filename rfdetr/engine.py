@@ -85,9 +85,15 @@ def train_one_epoch(
     assert batch_size % args.grad_accum_steps == 0
     sub_batch_size = batch_size // args.grad_accum_steps
     print("LENGTH OF DATA LOADER:", len(data_loader))
-    for data_iter_step, (samples, targets) in enumerate(
+    for data_iter_step, batch_data in enumerate(
         metric_logger.log_every(data_loader, print_freq, header)
     ):
+        # Handle optional reference images in batch
+        if len(batch_data) == 3:
+            samples, targets, ref_samples = batch_data
+        else:
+            samples, targets = batch_data
+            ref_samples = None
         it = start_steps + data_iter_step
         callback_dict = {
             "step": it,
@@ -124,9 +130,19 @@ def train_one_epoch(
             new_samples = NestedTensor(new_samples_tensors, samples.mask[start_idx:final_idx])
             new_samples = new_samples.to(device)
             new_targets = [{k: v.to(device) for k, v in t.items()} for t in targets[start_idx:final_idx]]
+            
+            # Handle reference images if provided
+            new_ref_samples = None
+            if ref_samples is not None:
+                new_ref_samples_tensors = ref_samples.tensors[start_idx:final_idx]
+                new_ref_samples = NestedTensor(new_ref_samples_tensors, ref_samples.mask[start_idx:final_idx])
+                new_ref_samples = new_ref_samples.to(device)
 
             with autocast(**get_autocast_args(args)):
-                outputs = model(new_samples, new_targets)
+                if new_ref_samples is not None:
+                    outputs = model(new_samples, new_targets, ref_img=new_ref_samples)
+                else:
+                    outputs = model(new_samples, new_targets)
                 loss_dict = criterion(outputs, new_targets)
                 weight_dict = criterion.weight_dict
                 losses = sum(
@@ -264,16 +280,31 @@ def evaluate(model, criterion, postprocess, data_loader, base_ds, device, args=N
     iou_types = ("bbox",) if not args.segmentation_head else ("bbox", "segm")
     coco_evaluator = CocoEvaluator(base_ds, iou_types)
 
-    for samples, targets in metric_logger.log_every(data_loader, 10, header):
+    for batch_data in metric_logger.log_every(data_loader, 10, header):
+        # Handle optional reference images in batch
+        if len(batch_data) == 3:
+            samples, targets, ref_samples = batch_data
+        else:
+            samples, targets = batch_data
+            ref_samples = None
+            
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        
+        if ref_samples is not None:
+            ref_samples = ref_samples.to(device)
 
         if args.fp16_eval:
             samples.tensors = samples.tensors.half()
+            if ref_samples is not None:
+                ref_samples.tensors = ref_samples.tensors.half()
 
         # Add autocast for evaluation
         with autocast(**get_autocast_args(args)):
-            outputs = model(samples)
+            if ref_samples is not None:
+                outputs = model(samples, ref_img=ref_samples)
+            else:
+                outputs = model(samples)
 
         if args.fp16_eval:
             for key in outputs.keys():

@@ -287,8 +287,18 @@ def get_sha():
 
 
 def collate_fn(batch):
+    """
+    Collate function for DataLoader.
+    Handles batches with optional reference images.
+    Expected batch format:
+    - Standard: (samples, targets)
+    - With ref: (samples, targets, ref_samples)
+    """
     batch = list(zip(*batch))
     batch[0] = nested_tensor_from_tensor_list(batch[0])
+    # If batch has 3 elements, the third is ref_samples
+    if len(batch) >= 3:
+        batch[2] = nested_tensor_from_tensor_list(batch[2])
     return tuple(batch)
 
 

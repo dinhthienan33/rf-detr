@@ -48,7 +48,9 @@ class LWDETR(nn.Module):
                  group_detr=1,
                  two_stage=False,
                  lite_refpoint_refine=False,
-                 bbox_reparam=False):
+                 bbox_reparam=False,
+                 ref_conditioning="none",
+                 use_box_only=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -76,6 +78,28 @@ class LWDETR(nn.Module):
         self.backbone = backbone
         self.aux_loss = aux_loss
         self.group_detr = group_detr
+        self.ref_conditioning = ref_conditioning
+        self.use_box_only = use_box_only
+
+        # Reference conditioning modules
+        if ref_conditioning == "gap_xattn":
+            # Get backbone output channels from the first feature map
+            # The projector scales features to hidden_dim, so final features have hidden_dim channels
+            backbone_out_channels = hidden_dim  # After projector scaling
+            
+            self.ref_pool = nn.AdaptiveAvgPool2d((1, 1))
+            self.ref_proj = nn.Sequential(
+                nn.Linear(backbone_out_channels, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+            )
+            # Cross-attention to condition queries on reference
+            self.ref_cross_attn = nn.MultiheadAttention(
+                embed_dim=hidden_dim, num_heads=8, batch_first=True
+            )
+        else:
+            self.ref_pool = None
+            self.ref_proj = None
+            self.ref_cross_attn = None
 
         # iter update
         self.lite_refpoint_refine = lite_refpoint_refine
@@ -128,10 +152,17 @@ class LWDETR(nn.Module):
             if hasattr(m, "export") and isinstance(m.export, Callable) and hasattr(m, "_export") and not m._export:
                 m.export()
 
-    def forward(self, samples: NestedTensor, targets=None):
-        """ The forward expects a NestedTensor, which consists of:
+    def forward(self, samples: NestedTensor, targets=None, ref_img=None, **kwargs):
+        """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
+
+            Args:
+                samples: Input images as NestedTensor, list, or Tensor
+                targets: Target annotations (for training)
+                ref_img: Optional reference images as Tensor [B, C, H, W] or NestedTensor
+                        If provided, will be used to condition queries (implementation in Sửa 2)
+                **kwargs: Additional keyword arguments
 
             It returns a dict with the following elements:
                - "pred_logits": the classification logits (including no-object) for all queries.
@@ -145,6 +176,21 @@ class LWDETR(nn.Module):
         """
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
+        
+        # Convert ref_img to NestedTensor if provided as Tensor
+        ref_img_nested = None
+        if ref_img is not None:
+            if isinstance(ref_img, torch.Tensor):
+                # ref_img is a batch tensor [B, C, H, W], convert to NestedTensor
+                # Create a mask of all False (no padding) since ref images are already processed
+                ref_mask = torch.zeros(
+                    ref_img.shape[0], ref_img.shape[2], ref_img.shape[3],
+                    dtype=torch.bool, device=ref_img.device
+                )
+                ref_img_nested = NestedTensor(ref_img, ref_mask)
+            elif isinstance(ref_img, NestedTensor):
+                ref_img_nested = ref_img
+        
         features, poss = self.backbone(samples)
 
         srcs = []
@@ -162,6 +208,29 @@ class LWDETR(nn.Module):
             # only use one group in inference
             refpoint_embed_weight = self.refpoint_embed.weight[:self.num_queries]
             query_feat_weight = self.query_feat.weight[:self.num_queries]
+
+        # Reference-conditioned queries (Sửa 2)
+        if ref_img_nested is not None and self.ref_conditioning == "gap_xattn":
+            # Encode reference image using shared backbone
+            ref_features, _ = self.backbone(ref_img_nested)
+            # Get the last feature map (highest resolution after projection)
+            ref_feat_nested = ref_features[-1]  # NestedTensor
+            ref_map = ref_feat_nested.tensors  # [B, C, H, W]
+            
+            # Global Average Pooling to get reference vector
+            ref_vec = self.ref_pool(ref_map).flatten(1)  # [B, C]
+            # Project to hidden_dim
+            q_ref = self.ref_proj(ref_vec).unsqueeze(1)  # [B, 1, D]
+            
+            # Condition learned queries with reference via cross-attention
+            # query_feat_weight: [num_queries * group_detr, D] -> [B, Q, D] for cross-attn
+            batch_size = samples.tensors.shape[0]
+            q_learned = query_feat_weight.unsqueeze(0).repeat(batch_size, 1, 1)  # [B, Q, D]
+            
+            # Cross-attention: queries attend to reference
+            q_cond, _ = self.ref_cross_attn(q_learned, q_ref, q_ref)  # [B, Q, D]
+            # Residual connection: learned queries + conditioned queries
+            query_feat_weight = q_learned + q_cond  # [B, Q, D] - keep batched for transformer
 
         hs, ref_unsigmoid, hs_enc, ref_enc = self.transformer(
             srcs, masks, poss, refpoint_embed_weight, query_feat_weight)
@@ -825,6 +894,8 @@ def build_model(args):
         two_stage=args.two_stage,
         lite_refpoint_refine=args.lite_refpoint_refine,
         bbox_reparam=args.bbox_reparam,
+        ref_conditioning=getattr(args, 'ref_conditioning', 'none'),
+        use_box_only=getattr(args, 'use_box_only', False),
     )
     return model
 

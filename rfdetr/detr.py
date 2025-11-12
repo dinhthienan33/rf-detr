@@ -223,6 +223,7 @@ class RFDETR:
         self,
         images: Union[str, Image.Image, np.ndarray, torch.Tensor, List[Union[str, np.ndarray, Image.Image, torch.Tensor]]],
         threshold: float = 0.5,
+        ref_images: Union[str, Image.Image, np.ndarray, torch.Tensor, List[Union[str, np.ndarray, Image.Image, torch.Tensor]], None] = None,
         **kwargs,
     ) -> Union[sv.Detections, List[sv.Detections]]:
         """Performs object detection on the input images and returns bounding box
@@ -239,6 +240,9 @@ class RFDETR:
                 as file paths, PIL Images, NumPy arrays, or torch.Tensors.
             threshold (float, optional):
                 The minimum confidence score needed to consider a detected bounding box valid.
+            ref_images (Union[str, Image.Image, np.ndarray, torch.Tensor, List[Union[str, np.ndarray, Image.Image, torch.Tensor]], None], optional):
+                Reference images to condition the queries. Must be same length as images.
+                If None, uses learned queries (backward compatible).
             **kwargs:
                 Additional keyword arguments.
 
@@ -260,10 +264,21 @@ class RFDETR:
         if not isinstance(images, list):
             images = [images]
 
+        # Validate ref_images if provided
+        if ref_images is not None:
+            if not isinstance(ref_images, list):
+                ref_images = [ref_images]
+            if len(ref_images) != len(images):
+                raise ValueError(
+                    f"ref_images must have the same length as images. "
+                    f"Got {len(ref_images)} reference images for {len(images)} images."
+                )
+
         orig_sizes = []
         processed_images = []
+        processed_ref_images = []
 
-        for img in images:
+        for idx, img in enumerate(images):
 
             if isinstance(img, str):
                 img = Image.open(img)
@@ -292,7 +307,39 @@ class RFDETR:
 
             processed_images.append(img_tensor)
 
+            # Process reference image if provided
+            if ref_images is not None:
+                ref_img = ref_images[idx]
+                
+                if isinstance(ref_img, str):
+                    ref_img = Image.open(ref_img)
+
+                if not isinstance(ref_img, torch.Tensor):
+                    ref_img = F.to_tensor(ref_img)
+                
+                if (ref_img > 1).any():
+                    raise ValueError(
+                        f"Reference image {idx} has pixel values above 1. Please ensure the image is "
+                        "normalized (scaled to [0, 1])."
+                    )
+                if ref_img.shape[0] != 3:
+                    raise ValueError(
+                        f"Invalid reference image shape. Expected 3 channels (RGB), but got "
+                        f"{ref_img.shape[0]} channels for reference image {idx}."
+                    )
+                
+                ref_img_tensor = ref_img.to(self.model.device)
+                ref_img_tensor = F.normalize(ref_img_tensor, self.means, self.stds)
+                ref_img_tensor = F.resize(ref_img_tensor, (self.model.resolution, self.model.resolution))
+                
+                processed_ref_images.append(ref_img_tensor)
+
         batch_tensor = torch.stack(processed_images)
+        
+        # Stack reference images if provided
+        ref_batch_tensor = None
+        if ref_images is not None:
+            ref_batch_tensor = torch.stack(processed_ref_images)
 
         if self._is_optimized_for_inference:
             if self._optimized_resolution != batch_tensor.shape[2]:
@@ -312,9 +359,20 @@ class RFDETR:
 
         with torch.inference_mode():
             if self._is_optimized_for_inference:
+                # Note: Optimized inference model may not support ref_images yet
+                # For now, warn if ref_images provided with optimized model
+                if ref_batch_tensor is not None:
+                    logger.warning(
+                        "Reference images provided but model is optimized for inference. "
+                        "Reference images will be ignored. Remove optimized model to use reference images."
+                    )
                 predictions = self.model.inference_model(batch_tensor.to(dtype=self._optimized_dtype))
             else:
-                predictions = self.model.model(batch_tensor)
+                # Pass ref_img to model if provided
+                if ref_batch_tensor is not None:
+                    predictions = self.model.model(batch_tensor, ref_img=ref_batch_tensor)
+                else:
+                    predictions = self.model.model(batch_tensor)
             if isinstance(predictions, tuple):
                 predictions = {
                     "pred_logits": predictions[1],

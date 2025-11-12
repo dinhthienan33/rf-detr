@@ -265,8 +265,18 @@ class Transformer(nn.Module):
             boxes_ts = torch.cat(boxes_ts, dim=1)#.transpose(0, 1)
         
         if self.dec_layers > 0:
-            tgt = query_feat.unsqueeze(0).repeat(bs, 1, 1)
-            refpoint_embed = refpoint_embed.unsqueeze(0).repeat(bs, 1, 1)
+            # Handle both batched (3D) and non-batched (2D) query_feat
+            if len(query_feat.shape) == 2:
+                tgt = query_feat.unsqueeze(0).repeat(bs, 1, 1)
+            else:
+                # Already batched [B, Q, D]
+                tgt = query_feat
+            # Handle both batched (3D) and non-batched (2D) refpoint_embed
+            if len(refpoint_embed.shape) == 2:
+                refpoint_embed = refpoint_embed.unsqueeze(0).repeat(bs, 1, 1)
+            else:
+                # Already batched [B, Q, 4]
+                refpoint_embed = refpoint_embed
             if self.two_stage:
                 ts_len = refpoint_embed_ts.shape[-2]
                 refpoint_embed_ts_subset = refpoint_embed[..., :ts_len, :]

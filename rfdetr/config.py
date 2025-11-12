@@ -37,6 +37,8 @@ class ModelConfig(BaseModel):
     cls_loss_coef: float = 1.0
     segmentation_head: bool = False
     mask_downsample_ratio: int = 4
+    ref_conditioning: Literal["none", "gap_xattn"] = "none"
+    use_box_only: bool = False
 
 
 class RFDETRBaseConfig(ModelConfig):
