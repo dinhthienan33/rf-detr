@@ -181,5 +181,8 @@ output/*
 
 train_test.py
 
+# PyTorch model checkpoints (large files)
+*.pth
+*.pt
 lwdetr_dinov2_small_o365_checkpoint.pth
 rf-detr-base.pth
