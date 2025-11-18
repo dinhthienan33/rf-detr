@@ -14,3 +14,4 @@
 # ------------------------------------------------------------------------
 
 from .lwdetr import build_model, build_criterion_and_postprocessors, PostProcess
+from .siamese_detr import SiameseDETR

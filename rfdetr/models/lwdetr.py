@@ -295,7 +295,10 @@ class SetCriterion(nn.Module):
                 use_varifocal_loss=False,
                 use_position_supervised_loss=False,
                 ia_bce_loss=False,
-                mask_point_sample_ratio: int = 16,):
+                mask_point_sample_ratio: int = 16,
+                use_siamese: bool = False,
+                match_margin: float = 0.5,
+                match_loss_coef: float = 1.0):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -304,6 +307,9 @@ class SetCriterion(nn.Module):
             losses: list of all the losses to be applied. See get_loss for list of available losses.
             focal_alpha: alpha in Focal Loss
             group_detr: Number of groups to speed detr training. Default is 1.
+            use_siamese: If True, use Siamese loss mode (contrastive loss instead of classification)
+            match_margin: Margin for contrastive loss in Siamese mode
+            match_loss_coef: Weight coefficient for matching loss
         """
         super().__init__()
         self.num_classes = num_classes
@@ -317,6 +323,9 @@ class SetCriterion(nn.Module):
         self.use_position_supervised_loss = use_position_supervised_loss
         self.ia_bce_loss = ia_bce_loss
         self.mask_point_sample_ratio = mask_point_sample_ratio
+        self.use_siamese = use_siamese
+        self.match_margin = match_margin
+        self.match_loss_coef = match_loss_coef
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (Binary focal loss)
@@ -516,12 +525,44 @@ class SetCriterion(nn.Module):
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
+    def loss_match(self, outputs, targets, indices, num_boxes):
+        """Contrastive loss for matching reference and object embeddings"""
+        v_ref = F.normalize(outputs["v_ref"], p=2, dim=1)  # [B, D]
+        obj_embeds = F.normalize(outputs["object_embeddings"], p=2, dim=2)  # [B, Q, D]
+        
+        loss_total = 0
+        for i, (idx_pred, idx_gt) in enumerate(indices):
+            if len(idx_pred) == 0:
+                continue
+            
+            # Positive pairs (matched queries)
+            positive_embeds = obj_embeds[i, idx_pred]  # [M, D]
+            positive_sim = torch.einsum('d,md->m', v_ref[i], positive_embeds)  # [M]
+            loss_positive = (1 - positive_sim).pow(2).mean()
+            
+            # Negative pairs (unmatched queries)
+            mask_negative = torch.ones(obj_embeds.shape[1], dtype=torch.bool, device=obj_embeds.device)
+            mask_negative[idx_pred] = False
+            
+            if mask_negative.sum() > 0:
+                negative_embeds = obj_embeds[i, mask_negative]  # [N, D]
+                negative_sim = torch.einsum('d,nd->n', v_ref[i], negative_embeds)  # [N]
+                # Push negatives away (below margin)
+                loss_negative = F.relu(negative_sim - self.match_margin).pow(2).mean()
+            else:
+                loss_negative = torch.tensor(0.0, device=v_ref.device)
+            
+            loss_total += loss_positive + loss_negative
+        
+        return {'loss_match': loss_total / max(len(indices), 1)}
+
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
             'labels': self.loss_labels,
             'cardinality': self.loss_cardinality,
             'boxes': self.loss_boxes,
             'masks': self.loss_masks,
+            'match': self.loss_match,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -533,6 +574,9 @@ class SetCriterion(nn.Module):
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
+        if self.use_siamese:
+            return self.forward_siamese(outputs, targets)
+        
         group_detr = self.group_detr if self.training else 1
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
 
@@ -577,6 +621,58 @@ class SetCriterion(nn.Module):
                 l_dict = self.get_loss(loss, enc_outputs, targets, indices, num_boxes, **kwargs)
                 l_dict = {k + f'_enc': v for k, v in l_dict.items()}
                 losses.update(l_dict)
+
+        return losses
+
+    def forward_siamese(self, outputs, targets):
+        """Forward pass for Siamese mode - uses matching loss instead of classification loss"""
+        group_detr = self.group_detr if self.training else 1
+        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+
+        # Retrieve the matching between the outputs of the last layer and the targets
+        indices = self.matcher(outputs_without_aux, targets, group_detr=group_detr)
+
+        # Compute the average number of target boxes accross all nodes, for normalization purposes
+        num_boxes = sum(len(t["boxes"]) for t in targets)
+        if not self.sum_group_losses:
+            num_boxes = num_boxes * group_detr
+        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
+        if is_dist_avail_and_initialized():
+            torch.distributed.all_reduce(num_boxes)
+        num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
+
+        # Compute losses for Siamese mode
+        losses = {}
+        # Bbox loss
+        losses.update(self.loss_boxes(outputs, targets, indices, num_boxes))
+        # GIoU loss (already included in loss_boxes, but we need it separately for weight_dict)
+        # Actually loss_boxes returns both loss_bbox and loss_giou
+        
+        # Matching loss (contrastive)
+        losses.update(self.loss_match(outputs, targets, indices, num_boxes))
+        
+        # Dummy class_error for logging compatibility
+        losses['class_error'] = torch.tensor(0.0, device=outputs["pred_boxes"].device)
+
+        # Handle auxiliary outputs if present
+        if 'aux_outputs' in outputs:
+            for i, aux_outputs in enumerate(outputs['aux_outputs']):
+                indices = self.matcher(aux_outputs, targets, group_detr=group_detr)
+                aux_losses = {}
+                aux_losses.update(self.loss_boxes(aux_outputs, targets, indices, num_boxes))
+                aux_losses.update(self.loss_match(aux_outputs, targets, indices, num_boxes))
+                aux_losses = {k + f'_{i}': v for k, v in aux_losses.items()}
+                losses.update(aux_losses)
+
+        # Handle encoder outputs if present (two_stage)
+        if 'enc_outputs' in outputs:
+            enc_outputs = outputs['enc_outputs']
+            indices = self.matcher(enc_outputs, targets, group_detr=group_detr)
+            enc_losses = {}
+            enc_losses.update(self.loss_boxes(enc_outputs, targets, indices, num_boxes))
+            enc_losses.update(self.loss_match(enc_outputs, targets, indices, num_boxes))
+            enc_losses = {k + f'_enc': v for k, v in enc_losses.items()}
+            losses.update(enc_losses)
 
         return losses
 
@@ -826,13 +922,30 @@ def build_model(args):
         lite_refpoint_refine=args.lite_refpoint_refine,
         bbox_reparam=args.bbox_reparam,
     )
+    
+    # Wrap with SiameseDETR if needed
+    if hasattr(args, 'use_siamese') and args.use_siamese:
+        from rfdetr.models.siamese_detr import SiameseDETR
+        model = SiameseDETR(model)
+    
     return model
 
 def build_criterion_and_postprocessors(args):
     device = torch.device(args.device)
     matcher = build_matcher(args)
-    weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
-    weight_dict['loss_giou'] = args.giou_loss_coef
+    
+    # Get Siamese parameters
+    use_siamese = getattr(args, 'use_siamese', False)
+    match_loss_coef = getattr(args, 'match_loss_coef', 1.0)
+    match_margin = getattr(args, 'match_margin', 0.5)
+    
+    # Build weight_dict based on mode
+    if use_siamese:
+        weight_dict = {'loss_bbox': args.bbox_loss_coef, 'loss_giou': args.giou_loss_coef, 'loss_match': match_loss_coef}
+    else:
+        weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
+        weight_dict['loss_giou'] = args.giou_loss_coef
+    
     if args.segmentation_head:
         weight_dict['loss_mask_ce'] = args.mask_ce_loss_coef
         weight_dict['loss_mask_dice'] = args.mask_dice_loss_coef
@@ -845,7 +958,12 @@ def build_criterion_and_postprocessors(args):
             aux_weight_dict.update({k + f'_enc': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    losses = ['labels', 'boxes', 'cardinality']
+    # Build losses list based on mode
+    if use_siamese:
+        losses = ['boxes', 'match']  # Skip labels and cardinality for Siamese mode
+    else:
+        losses = ['labels', 'boxes', 'cardinality']
+    
     if args.segmentation_head:
         losses.append('masks')
 
@@ -860,14 +978,20 @@ def build_criterion_and_postprocessors(args):
                                 use_varifocal_loss = args.use_varifocal_loss,
                                 use_position_supervised_loss=args.use_position_supervised_loss,
                                 ia_bce_loss=args.ia_bce_loss,
-                                mask_point_sample_ratio=args.mask_point_sample_ratio)
+                                mask_point_sample_ratio=args.mask_point_sample_ratio,
+                                use_siamese=use_siamese,
+                                match_margin=match_margin,
+                                match_loss_coef=match_loss_coef)
     else:
         criterion = SetCriterion(args.num_classes + 1, matcher=matcher, weight_dict=weight_dict,
                                 focal_alpha=args.focal_alpha, losses=losses, 
                                 group_detr=args.group_detr, sum_group_losses=sum_group_losses,
                                 use_varifocal_loss = args.use_varifocal_loss,
                                 use_position_supervised_loss=args.use_position_supervised_loss,
-                                ia_bce_loss=args.ia_bce_loss)
+                                ia_bce_loss=args.ia_bce_loss,
+                                use_siamese=use_siamese,
+                                match_margin=match_margin,
+                                match_loss_coef=match_loss_coef)
     criterion.to(device)
     postprocess = PostProcess(num_select=args.num_select)
 

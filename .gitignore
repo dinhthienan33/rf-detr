@@ -180,3 +180,6 @@ rf-detr*
 output/*
 
 train_test.py
+
+lwdetr_dinov2_small_o365_checkpoint.pth
+rf-detr-base.pth

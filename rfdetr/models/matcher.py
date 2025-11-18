@@ -37,22 +37,30 @@ class HungarianMatcher(nn.Module):
     """
 
     def __init__(self, cost_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1, focal_alpha: float = 0.25, use_pos_only: bool = False,
-                 use_position_modulated_cost: bool = False, mask_point_sample_ratio: int = 16, cost_mask_ce: float = 1, cost_mask_dice: float = 1):
+                 use_position_modulated_cost: bool = False, mask_point_sample_ratio: int = 16, cost_mask_ce: float = 1, cost_mask_dice: float = 1,
+                 use_siamese: bool = False, cost_match: float = 1.0):
         """Creates the matcher
         Params:
             cost_class: This is the relative weight of the classification error in the matching cost
             cost_bbox: This is the relative weight of the L1 error of the bounding box coordinates in the matching cost
             cost_giou: This is the relative weight of the giou loss of the bounding box in the matching cost
+            use_siamese: If True, use Siamese matching mode (cosine similarity instead of classification)
+            cost_match: Weight for matching cost in Siamese mode
         """
         super().__init__()
         self.cost_class = cost_class
         self.cost_bbox = cost_bbox
         self.cost_giou = cost_giou
-        assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0"
+        if not use_siamese:
+            assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0"
+        else:
+            assert cost_match != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0 in Siamese mode"
         self.focal_alpha = focal_alpha
         self.mask_point_sample_ratio = mask_point_sample_ratio
         self.cost_mask_ce = cost_mask_ce
         self.cost_mask_dice = cost_mask_dice
+        self.use_siamese = use_siamese
+        self.cost_match = cost_match
 
     @torch.no_grad()
     def forward(self, outputs, targets, group_detr=1):
@@ -61,6 +69,10 @@ class HungarianMatcher(nn.Module):
             outputs: This is a dict that contains at least these entries:
                  "pred_logits": Tensor of dim [batch_size, num_queries, num_classes] with the classification logits
                  "pred_boxes": Tensor of dim [batch_size, num_queries, 4] with the predicted box coordinates
+                 OR for Siamese mode:
+                 "v_ref": Tensor of dim [batch_size, D] - reference vector
+                 "object_embeddings": Tensor of dim [batch_size, num_queries, D] - object embeddings
+                 "pred_boxes": Tensor of dim [batch_size, num_queries, 4] - predicted boxes
             targets: This is a list of targets (len(targets) = batch_size), where each target is a dict containing:
                  "labels": Tensor of dim [num_target_boxes] (where num_target_boxes is the number of ground-truth
                            objects in the target) containing the class labels
@@ -74,6 +86,9 @@ class HungarianMatcher(nn.Module):
             For each batch element, it holds:
                 len(index_i) = len(index_j) = min(num_queries, num_target_boxes)
         """
+        if self.use_siamese:
+            return self.forward_siamese(outputs, targets, group_detr)
+        
         bs, num_queries = outputs["pred_logits"].shape[:2]
 
         # We flatten to compute the cost matrices in a batch
@@ -159,8 +174,103 @@ class HungarianMatcher(nn.Module):
                 ]
         return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
 
+    @torch.no_grad()
+    def forward_siamese(self, outputs, targets, group_detr=1):
+        """
+        Forward pass for Siamese matching mode
+        Uses cosine similarity instead of classification cost
+        
+        Params:
+            outputs: Dict containing:
+                "v_ref": Tensor [batch_size, D] - reference vector
+                "object_embeddings": Tensor [batch_size, num_queries, D] - object embeddings
+                "pred_boxes": Tensor [batch_size, num_queries, 4] - predicted boxes
+            targets: List of target dicts (same as standard forward)
+            group_detr: Number of groups used for matching
+        
+        Returns:
+            List of (index_i, index_j) tuples (same format as standard forward)
+        """
+        bs, num_queries = outputs["pred_boxes"].shape[:2]
+        
+        # Extract reference vector and object embeddings
+        v_ref = outputs["v_ref"]  # [B, D]
+        obj_embeds = outputs["object_embeddings"]  # [B, Q, D]
+        pred_bboxes = outputs["pred_boxes"]  # [B, Q, 4]
+        
+        # Normalize for cosine similarity
+        v_ref_norm = F.normalize(v_ref, p=2, dim=1)  # [B, D]
+        obj_embeds_norm = F.normalize(obj_embeds, p=2, dim=2)  # [B, Q, D]
+        
+        # Compute similarity: [B, Q]
+        # For each query, compute similarity with v_ref
+        sim_matrix = torch.einsum('bd,bqd->bq', v_ref_norm, obj_embeds_norm)  # [B, Q]
+        
+        # Cost: 1 - similarity (lower similarity = higher cost)
+        cost_match = 1 - sim_matrix  # [B, Q]
+        
+        # Get GT boxes and labels
+        tgt_bbox = torch.cat([v["boxes"] for v in targets])  # [T, 4]
+        tgt_labels = torch.cat([v["labels"] for v in targets])  # [T]
+        
+        # Flatten predictions
+        out_bbox = pred_bboxes.flatten(0, 1)  # [B*Q, 4]
+        
+        # Compute bbox costs
+        cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)  # [B*Q, T]
+        
+        # Compute GIoU cost
+        giou = generalized_box_iou(
+            box_cxcywh_to_xyxy(out_bbox),
+            box_cxcywh_to_xyxy(tgt_bbox)
+        )
+        cost_giou = -giou  # [B*Q, T]
+        
+        # Expand cost_match to match GT boxes
+        # For each GT, use the same matching cost
+        # cost_match is [B, Q], we need [B*Q, T]
+        cost_match_expanded = cost_match.unsqueeze(-1).expand(-1, -1, len(tgt_bbox))  # [B, Q, T]
+        cost_match_expanded = cost_match_expanded.flatten(0, 1)  # [B*Q, T]
+        
+        # Combined cost
+        C = (
+            self.cost_bbox * cost_bbox +
+            self.cost_giou * cost_giou +
+            self.cost_match * cost_match_expanded
+        )
+        
+        C = C.view(bs, num_queries, -1).float().cpu()
+        
+        # Handle NaN/Inf
+        max_cost = C.max() if C.numel() > 0 else 0
+        C[C.isinf() | C.isnan()] = max_cost * 2
+        
+        # Hungarian matching
+        sizes = [len(v["boxes"]) for v in targets]
+        indices = []
+        g_num_queries = num_queries // group_detr
+        C_list = C.split(g_num_queries, dim=1)
+        
+        for g_i in range(group_detr):
+            C_g = C_list[g_i]
+            indices_g = [linear_sum_assignment(c[i]) for i, c in enumerate(C_g.split(sizes, -1))]
+            if g_i == 0:
+                indices = indices_g
+            else:
+                indices = [
+                    (np.concatenate([indice1[0], indice2[0] + g_num_queries * g_i]), 
+                     np.concatenate([indice1[1], indice2[1]]))
+                    for indice1, indice2 in zip(indices, indices_g)
+                ]
+        
+        return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
+
 
 def build_matcher(args):
+    # Get Siamese parameters if available
+    use_siamese = getattr(args, 'use_siamese', False)
+    cost_match = getattr(args, 'cost_match', 1.0)
+    
     if args.segmentation_head:
         return HungarianMatcher(
             cost_class=args.set_cost_class,
@@ -169,11 +279,16 @@ def build_matcher(args):
             focal_alpha=args.focal_alpha,
             cost_mask_ce=args.mask_ce_loss_coef,
             cost_mask_dice=args.mask_dice_loss_coef,
-            mask_point_sample_ratio=args.mask_point_sample_ratio,)
+            mask_point_sample_ratio=args.mask_point_sample_ratio,
+            use_siamese=use_siamese,
+            cost_match=cost_match,
+        )
     else:
         return HungarianMatcher(
             cost_class=args.set_cost_class,
             cost_bbox=args.set_cost_bbox,
             cost_giou=args.set_cost_giou,
             focal_alpha=args.focal_alpha,
+            use_siamese=use_siamese,
+            cost_match=cost_match,
         )

@@ -97,10 +97,14 @@ class Model:
             if 'args' in checkpoint and hasattr(checkpoint['args'], 'class_names'):
                 self.args.class_names = checkpoint['args'].class_names
                 self.class_names = checkpoint['args'].class_names
-                
-            checkpoint_num_classes = checkpoint['model']['class_embed.bias'].shape[0]
-            if checkpoint_num_classes != args.num_classes + 1:
-                self.reinitialize_detection_head(checkpoint_num_classes)
+            
+            # Reinitialize detection head if needed (skip for Siamese mode)
+            # Siamese mode doesn't use class_embed, so this check may fail
+            if not (hasattr(args, 'use_siamese') and args.use_siamese):
+                if 'class_embed.bias' in checkpoint['model']:
+                    checkpoint_num_classes = checkpoint['model']['class_embed.bias'].shape[0]
+                    if checkpoint_num_classes != args.num_classes + 1:
+                        self.reinitialize_detection_head(checkpoint_num_classes)
             # add support to exclude_keys
             # e.g., when load object365 pretrain, do not load `class_embed.[weight, bias]`
             if args.pretrain_exclude_keys is not None:
@@ -145,6 +149,34 @@ class Model:
         self.model = self.model.to(self.device)
         self.postprocess = PostProcess(num_select=args.num_select)
         self.stop_early = False
+    
+    def forward(self, samples, targets=None, ref_imgs=None):
+        """
+        Forward pass for Model class
+        
+        Args:
+            samples: NestedTensor or Tensor - target images/frames
+            targets: Optional[List[Dict]] - ground truth targets (for training)
+            ref_imgs: Optional[List[List[Tensor]]] - reference images for Siamese mode
+        
+        Returns:
+            Dictionary with model outputs
+        """
+        if self.args.use_siamese or self.args.dataset_file == 'aeroeyes':
+            # Siamese mode: need ref_imgs
+            if ref_imgs is None:
+                raise ValueError("ref_imgs required for Siamese mode. Please provide ref_imgs parameter.")
+            
+            # Ensure samples is NestedTensor if needed
+            from rfdetr.util.misc import NestedTensor, nested_tensor_from_tensor_list
+            if isinstance(samples, (list, torch.Tensor)):
+                samples = nested_tensor_from_tensor_list(samples)
+            
+            # Call SiameseDETR forward
+            return self.model(ref_imgs, samples, targets)
+        else:
+            # Standard DETR mode
+            return self.model(samples, targets)
     
     def reinitialize_detection_head(self, num_classes):
         self.model.reinitialize_detection_head(num_classes)
@@ -199,7 +231,7 @@ class Model:
         # Choose the learning rate scheduler based on the new argument
 
         dataset_train = build_dataset(image_set='train', args=args, resolution=args.resolution)
-        dataset_val = build_dataset(image_set='val', args=args, resolution=args.resolution)
+        dataset_val = build_dataset(image_set=  'val', args=args, resolution=args.resolution)
         dataset_test = build_dataset(image_set='test' if args.dataset_file == "roboflow" else "val", args=args, resolution=args.resolution)
 
         # for cosine annealing, calculate total training steps and warmup steps
@@ -233,6 +265,18 @@ class Model:
             sampler_test = torch.utils.data.SequentialSampler(dataset_test)
 
         effective_batch_size = args.batch_size * args.grad_accum_steps
+        
+        # Use aeroeyes_collate_fn for Siamese mode or AeroEyes dataset
+        collate_fn_train = utils.collate_fn
+        collate_fn_val = utils.collate_fn
+        collate_fn_test = utils.collate_fn
+        
+        if (hasattr(args, 'use_siamese') and args.use_siamese) or args.dataset_file == 'aeroeyes':
+            from rfdetr.datasets.aeroeyes import aeroeyes_collate_fn
+            collate_fn_train = aeroeyes_collate_fn
+            collate_fn_val = aeroeyes_collate_fn
+            collate_fn_test = aeroeyes_collate_fn
+        
         min_batches = kwargs.get('min_batches', 5)
         if len(dataset_train) < effective_batch_size * min_batches:
             logger.info(
@@ -246,7 +290,7 @@ class Model:
             data_loader_train = DataLoader(
                 dataset_train,
                 batch_size=effective_batch_size,
-                collate_fn=utils.collate_fn,
+                collate_fn=collate_fn_train,
                 num_workers=args.num_workers,
                 sampler=sampler,
             )
@@ -256,15 +300,15 @@ class Model:
             data_loader_train = DataLoader(
                 dataset_train, 
                 batch_sampler=batch_sampler_train,
-                collate_fn=utils.collate_fn, 
+                collate_fn=collate_fn_train, 
                 num_workers=args.num_workers
             )
         
         data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
-                                    drop_last=False, collate_fn=utils.collate_fn, 
+                                    drop_last=False, collate_fn=collate_fn_val, 
                                     num_workers=args.num_workers)
         data_loader_test = DataLoader(dataset_test, args.batch_size, sampler=sampler_test,
-                                    drop_last=False, collate_fn=utils.collate_fn, 
+                                    drop_last=False, collate_fn=collate_fn_test, 
                                     num_workers=args.num_workers)
 
         base_ds = get_coco_api_from_dataset(dataset_val)

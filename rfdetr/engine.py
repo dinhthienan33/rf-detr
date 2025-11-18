@@ -85,9 +85,21 @@ def train_one_epoch(
     assert batch_size % args.grad_accum_steps == 0
     sub_batch_size = batch_size // args.grad_accum_steps
     print("LENGTH OF DATA LOADER:", len(data_loader))
-    for data_iter_step, (samples, targets) in enumerate(
+    
+    # Check if Siamese mode
+    use_siamese = getattr(args, 'use_siamese', False) or getattr(args, 'dataset_file', None) == 'aeroeyes'
+    
+    for data_iter_step, batch_data in enumerate(
         metric_logger.log_every(data_loader, print_freq, header)
     ):
+        # Unpack batch data based on mode
+        if use_siamese:
+            # Siamese mode: data_loader returns (ref_imgs_batch, samples, targets)
+            ref_imgs_batch, samples, targets = batch_data
+        else:
+            # Standard mode: data_loader returns (samples, targets)
+            samples, targets = batch_data
+            ref_imgs_batch = None
         it = start_steps + data_iter_step
         callback_dict = {
             "step": it,
@@ -124,9 +136,21 @@ def train_one_epoch(
             new_samples = NestedTensor(new_samples_tensors, samples.mask[start_idx:final_idx])
             new_samples = new_samples.to(device)
             new_targets = [{k: v.to(device) for k, v in t.items()} for t in targets[start_idx:final_idx]]
+            
+            # Handle ref_imgs for Siamese mode
+            if use_siamese:
+                # Extract ref_imgs for this sub-batch
+                new_ref_imgs = ref_imgs_batch[start_idx:final_idx]
+                # Move each ref image to device
+                new_ref_imgs = [[r.to(device) for r in refs] for refs in new_ref_imgs]
 
             with autocast(**get_autocast_args(args)):
-                outputs = model(new_samples, new_targets)
+                if use_siamese:
+                    # Siamese mode: pass ref_imgs to model
+                    outputs = model(new_samples, new_targets, ref_imgs=new_ref_imgs)
+                else:
+                    # Standard mode: normal forward
+                    outputs = model(new_samples, new_targets)
                 loss_dict = criterion(outputs, new_targets)
                 weight_dict = criterion.weight_dict
                 losses = sum(
@@ -263,8 +287,22 @@ def evaluate(model, criterion, postprocess, data_loader, base_ds, device, args=N
 
     iou_types = ("bbox",) if not args.segmentation_head else ("bbox", "segm")
     coco_evaluator = CocoEvaluator(base_ds, iou_types)
+    
+    # Check if Siamese mode
+    use_siamese = getattr(args, 'use_siamese', False) or getattr(args, 'dataset_file', None) == 'aeroeyes'
 
-    for samples, targets in metric_logger.log_every(data_loader, 10, header):
+    for batch_data in metric_logger.log_every(data_loader, 10, header):
+        # Unpack batch data based on mode
+        if use_siamese:
+            # Siamese mode: data_loader returns (ref_imgs_batch, samples, targets)
+            ref_imgs_batch, samples, targets = batch_data
+            # Move ref_imgs to device
+            ref_imgs_batch = [[r.to(device) for r in refs] for refs in ref_imgs_batch]
+        else:
+            # Standard mode: data_loader returns (samples, targets)
+            samples, targets = batch_data
+            ref_imgs_batch = None
+        
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
@@ -273,7 +311,12 @@ def evaluate(model, criterion, postprocess, data_loader, base_ds, device, args=N
 
         # Add autocast for evaluation
         with autocast(**get_autocast_args(args)):
-            outputs = model(samples)
+            if use_siamese:
+                # Siamese mode: pass ref_imgs to model
+                outputs = model(samples, targets, ref_imgs=ref_imgs_batch)
+            else:
+                # Standard mode: normal forward
+                outputs = model(samples)
 
         if args.fp16_eval:
             for key in outputs.keys():

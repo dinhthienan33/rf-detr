@@ -37,6 +37,11 @@ class ModelConfig(BaseModel):
     cls_loss_coef: float = 1.0
     segmentation_head: bool = False
     mask_downsample_ratio: int = 4
+    # Siamese DETR flags
+    use_siamese: bool = False
+    match_loss_coef: float = 1.0
+    match_margin: float = 0.5
+    cost_match: float = 1.0
 
 
 class RFDETRBaseConfig(ModelConfig):
@@ -138,7 +143,7 @@ class TrainConfig(BaseModel):
     ia_bce_loss: bool = True
     cls_loss_coef: float = 1.0
     num_select: int = 300
-    dataset_file: Literal["coco", "o365", "roboflow"] = "roboflow"
+    dataset_file: Literal["coco", "o365", "roboflow", "aeroeyes"] = "roboflow"
     square_resize_div_64: bool = True
     dataset_dir: str
     output_dir: str = "output"
